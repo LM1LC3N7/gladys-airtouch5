@@ -1,6 +1,6 @@
 {
   "name": "gladys-airtouch5",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Gladys Assistant external integration for AirTouch 5 consoles (Polyaire): the ACs and zones of a ducted air-conditioning system (on/off, mode, fan speed, setpoint, damper opening, temperatures) over the local TCP protocol of the console. Unofficial, not affiliated with Polyaire.",
   "type": "module",

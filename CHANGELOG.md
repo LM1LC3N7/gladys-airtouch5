@@ -10,6 +10,8 @@ the notes of the version's GitHub Release.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-05
+
 ### Added
 
 - First version: the air conditioners and zones of an AirTouch 5 console
@@ -23,3 +25,6 @@ the notes of the version's GitHub Release.
 - Stops never refused: sent first, kept in `/data` until a read shows them,
   sent again by the reads that contradict them (3 times at most).
 - Other commands behind the "Allow the commands" option, off by default.
+
+[Unreleased]: https://github.com/LM1LC3N7/gladys-airtouch5/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/LM1LC3N7/gladys-airtouch5/releases/tag/v0.1.1
