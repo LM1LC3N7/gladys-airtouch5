@@ -100,3 +100,33 @@ test('an answer from another address, or naming another one, or none: undefined'
     undefined,
   );
 });
+
+test('a try aborted (a new session) frees the port at once: the next try binds it', async (t) => {
+  const localPort = await freePort();
+  const mute = await udpConsole(t, () => undefined);
+  const abort = new AbortController();
+  const first = identityOnce({
+    ip: '127.0.0.1',
+    port: mute.port,
+    localPort,
+    waitMs: 5_000,
+    signal: abort.signal,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  abort.abort();
+  // The next try starts at once (the first one is not awaited: aborted, it is over).
+  const ephemeral = [];
+  const dev = await udpConsole(t, () => '127.0.0.1,AT5N202502000001,AirTouch5,4300000,Home', {
+    replyPort: localPort,
+  });
+  const identity = await identityOnce({
+    ip: '127.0.0.1',
+    port: dev.port,
+    localPort,
+    waitMs: 1000,
+    onEphemeral: (e) => ephemeral.push(e),
+  });
+  assert.equal(identity?.consoleId, 'at5n202502000001');
+  assert.deepEqual(ephemeral, [false]);
+  assert.equal(await first, undefined);
+});

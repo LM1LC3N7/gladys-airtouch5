@@ -122,7 +122,8 @@ l'identifiant est gardé pour cette adresse.
 - envoyées dans les 3 s du clic, sinon refusées sans rien envoyer ; les
   commandes qui arrivent ensemble (une scène) partagent une lecture et une
   écriture de leur sorte (climatisations ou zones) : une console lente les
-  reçoit toutes ;
+  reçoit toutes (les réglages d'une même climatisation cliqués ensemble partent
+  dans une seule entrée) ;
 - confirmées seulement si la console montre la valeur demandée (un état égal à
   celui d'avant n'est pas une confirmation), d'ici 3,5 s ; sinon « Envoyée, sans
   confirmation » et la console est relue 5 s et 20 s plus tard ;

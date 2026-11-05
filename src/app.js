@@ -572,8 +572,9 @@ export class AirTouchApp {
   sessionClosed(session, reason) {
     if (this.session !== session) return;
     this.session = undefined;
-    // The identity is checked again on the next session.
+    // The identity is checked again on the next session (its UDP try stopped now).
     this.identity = 'none';
+    this.identityAbort?.abort();
     if (!this.closed) {
       this.logger.info(`AirTouch 5: session closed (${reason})`);
       this.lastStatus = undefined;
@@ -589,6 +590,14 @@ export class AirTouchApp {
    * One request on the lane: `priority`, waiting at most `waitMs` for its
    * turn; resolves the value of the answer.
    */
+  /**
+   * One request on the lane: `priority`, waiting until `waitBy` for its turn.
+   * The session gives up on the request only after a real silence
+   * (`timeoutMs`, by default the request timeout, counted from the write) and
+   * then closes; a caller with an earlier deadline (`answerBy`) is answered
+   * at it, but the request stays in flight on the lane until its answer (taken
+   * and dropped, never given to another request) or that silence.
+   */
   async exchange(
     priority,
     build,
@@ -599,26 +608,48 @@ export class AirTouchApp {
       throw new SessionError(ERROR_KINDS.LATE, 'too late');
     }
     const release = await this.lane.acquire(priority, { waitMs });
+    let request;
     try {
       const session = this.session;
       if (!session || session.closed) {
         throw new SessionError(ERROR_KINDS.CLOSED, 'not connected');
       }
-      if (this.monotonic() > waitBy) {
+      const now = this.monotonic();
+      if (now > waitBy || (answerBy !== undefined && !(answerBy - now > 0))) {
         throw new SessionError(ERROR_KINDS.LATE, 'too late');
       }
-      const left = answerBy !== undefined ? answerBy - this.monotonic() : timeoutMs;
-      const value = await session.request(build, {
+      let written = false;
+      request = session.request(build, {
         kind,
-        timeoutMs: left,
+        timeoutMs: timeoutMs ?? TIMINGS.requestTimeout,
         beforeSend,
-        onWritten,
+        onWritten: () => {
+          written = true;
+          onWritten?.();
+        },
         tag,
         closeOnTimeout,
       });
-      return { value, session };
+      // The lane is held until the request really ends.
+      request.then(release, release);
+      if (answerBy === undefined) {
+        return { value: await request, session };
+      }
+      let timer;
+      const late = new Promise((resolve, reject) => {
+        timer = this.timers.setTimeout(
+          () =>
+            reject(new SessionError(ERROR_KINDS.TIMEOUT, 'no answer in time', { sent: written })),
+          Math.max(0, answerBy - this.monotonic()),
+        );
+      });
+      try {
+        return { value: await Promise.race([request, late]), session };
+      } finally {
+        this.timers.clearTimeout(timer);
+      }
     } finally {
-      release();
+      if (!request) release();
     }
   }
 
@@ -637,7 +668,11 @@ export class AirTouchApp {
   }
 
   async doCheckIdentity(session) {
+    // (The try of a previous session was stopped when it closed: see sessionClosed.)
+    const abort = new AbortController();
+    this.identityAbort = abort;
     const identity = await this.identify({
+      signal: abort.signal,
       ip: this.ip,
       port: DISCOVERY_PORT,
       localPort: DISCOVERY_PORT,
@@ -1316,25 +1351,28 @@ export class AirTouchApp {
     if (this.waitingCommands >= LIMITS.queue) {
       throw this.refusal(ERRORS.queueFull);
     }
-    // One command at a time per target, in order of arrival.
+    // One command at a time per target and field, in order of arrival: the
+    // commands of other fields of the same target (a mode and a setpoint)
+    // share the read and go in the same control entry.
     const entry = { cancelled: false };
     const list = this.commands.get(key) ?? new Set();
     list.add(entry);
     this.commands.set(key, list);
     this.waitingCommands += 1;
-    const previous = this.chains.get(key) ?? Promise.resolve();
+    const chainKey = `${key}:${change.field}`;
+    const previous = this.chains.get(chainKey) ?? Promise.resolve();
     const run = previous
       .catch(() => {})
       .then(() => this.command(target, change, { received, entry }));
     const tail = run.catch(() => {});
-    this.chains.set(key, tail);
+    this.chains.set(chainKey, tail);
     try {
       return await run;
     } finally {
       list.delete(entry);
       if (list.size === 0) this.commands.delete(key);
       this.waitingCommands -= 1;
-      if (this.chains.get(key) === tail) this.chains.delete(key);
+      if (this.chains.get(chainKey) === tail) this.chains.delete(chainKey);
     }
   }
 
@@ -1512,28 +1550,30 @@ export class AirTouchApp {
           PRIORITY.COMMAND,
           (id) =>
             isAc
-              ? acControl(
-                  id,
-                  batch.map((i) => i.control),
-                )
-              : zoneControl(
-                  id,
-                  batch.map((i) => i.control),
-                ),
+              ? acControl(id, mergeControls(batch, 'ac'))
+              : zoneControl(id, mergeControls(batch, 'zone')),
           {
             kind: isAc ? KIND.AC_STATUS : KIND.ZONE_STATUS,
             waitBy,
             answerBy,
             // Each one checked right before the write (option, cancel, identity, deadline).
             beforeSend: () => {
+              const later = [];
               for (const item of queue.splice(0)) {
                 try {
                   this.beforeSend(item.entry, item.sendBy);
+                  // A zone entry carries one value: a second value of the same
+                  // zone (opening and setpoint) goes in the next frame.
+                  if (!isAc && conflicts(batch, item)) {
+                    later.push(item);
+                    continue;
+                  }
                   batch.push(item);
                 } catch (err) {
                   item.resolve({ written: false, error: err, refused: true });
                 }
               }
+              queue.unshift(...later);
               if (batch.length === 0) throw new Error('nothing to write');
             },
             onWritten: () => {
@@ -1898,6 +1938,27 @@ export class AirTouchApp {
       this.timers.clearTimeout(timer);
     };
   }
+}
+
+/**
+ * The controls of a batch, one entry per target: the settings of one target
+ * (mode, fan speed, setpoint, power) merged into its entry.
+ */
+function mergeControls(batch, key) {
+  const byTarget = new Map();
+  for (const { control } of batch) {
+    byTarget.set(control[key], { ...byTarget.get(control[key]), ...control });
+  }
+  return [...byTarget.values()];
+}
+
+/** Whether a zone control would put a second value in an entry of the batch. */
+function conflicts(batch, item) {
+  const hasValue = (c) => c.percent !== undefined || c.setpoint !== undefined;
+  return (
+    hasValue(item.control) &&
+    batch.some((other) => other.control.zone === item.control.zone && hasValue(other.control))
+  );
 }
 
 /** Equality of two values of a field (setpoints to 0.05 °C). */

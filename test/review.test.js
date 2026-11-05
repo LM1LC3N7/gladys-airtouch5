@@ -268,12 +268,164 @@ test('r1-6: the option is checked on arrival: no read, no /data write', async (t
   assert.equal(ctx.store.saves, saves);
 });
 
-test('r1 minor: a state read that times out closes the session (its late answer is never taken)', async (t) => {
+test('r1 minor / r2: a read silent for the request timeout closes the session; a slow answer does not', async (t) => {
   const ctx = await setup(t, ALLOW);
   await firstRead(ctx);
   ctx.dev.ignore.add('ac-status');
   const err = await answer(ctx, click(ctx, F('ac', 0, 'mode'), 2), { step: 50 });
   assert.notEqual(err, 'ok');
-  assert.equal(ctx.app.session, undefined);
   assert.equal(ctx.dev.controls('ac').length, 0);
+  // Closed on the real silence (3 s after the write), not on the deadline of the command.
+  await until(ctx.clock, () => ctx.app.session === undefined, 'closed on silence', { step: 50 });
+});
+
+test('r2: a command whose deadline passes while the console answers slowly keeps the session; the late answer is taken by no one', async (t) => {
+  const ctx = await setup(t, ALLOW);
+  await firstRead(ctx);
+  ctx.dev.timers = ctx.clock.timers;
+  ctx.dev.latencyMs = 2_900;
+  const session = ctx.app.session;
+  const err = await answer(ctx, click(ctx, F('ac', 0, 'mode'), 2), { step: 20 });
+  assert.notEqual(err, 'ok');
+  // The answer comes at 2.9 s from the write: swallowed, the session lives on.
+  await ctx.clock.advance(3_500);
+  await settle(5);
+  assert.equal(ctx.app.session, session);
+  assert.equal(session.closed, false);
+  // The next request gets its own answer.
+  ctx.dev.latencyMs = 0;
+  assert.equal(await answer(ctx, click(ctx, F('zone', 1, 'opening'), 33)), 'ok');
+});
+
+for (const latency of [600, 900]) {
+  test(`r2: mode + setpoint of one AC and 3 zones at once, console answering in ${latency} ms: all set`, async (t) => {
+    const ctx = await setup(t, ALLOW);
+    await firstRead(ctx);
+    ctx.dev.timers = ctx.clock.timers;
+    ctx.dev.latencyMs = latency;
+    const results = [
+      click(ctx, F('ac', 0, 'mode'), 2),
+      click(ctx, F('ac', 0, 'target-temperature'), 24),
+      ...[0, 3, 4].map((n) => click(ctx, F('zone', n, 'opening'), 50 + n)),
+    ];
+    const acks = await answer(ctx, Promise.all(results), { step: 10 });
+    if (latency <= 600) {
+      assert.deepEqual(acks, ['ok', 'ok', 'ok', 'ok', 'ok']);
+    } else {
+      // Two reads and two writes in a row take 3.6 s: the kind written second is
+      // set but answered after the 3.5 s of the ack ("sent, without
+      // confirmation"), never refused unsent.
+      for (const ack of acks) assert.ok(ack === 'ok' || /without confirmation/.test(ack.message));
+    }
+    assert.deepEqual([ctx.dev.acs[0].mode, ctx.dev.acs[0].setpoint], [1, 24]);
+    assert.deepEqual(
+      [0, 3, 4].map((n) => ctx.dev.zones[n].percent),
+      [50, 53, 54],
+    );
+    // The two settings of the AC in one entry of one frame.
+    const acFrames = ctx.dev.controls('ac');
+    assert.equal(acFrames.length, 1);
+    assert.equal(acFrames[0].entries.length, 1);
+    assert.equal(ctx.dev.controls('zone').length, 1);
+  });
+}
+
+test('r2: commands clicked within the gathering time share one status read', async (t) => {
+  const ctx = await setup(t, ALLOW);
+  await firstRead(ctx);
+  ctx.dev.timers = ctx.clock.timers;
+  ctx.dev.latencyMs = 300;
+  const reads = ctx.dev.count(0x21);
+  const a = click(ctx, F('zone', 1, 'opening'), 41);
+  // 10 ms later (the clock run in small steps, its timers firing on the way).
+  for (let i = 0; i < 5; i += 1) await ctx.clock.advance(2);
+  const b = click(ctx, F('zone', 4, 'opening'), 44);
+  assert.deepEqual(await answer(ctx, Promise.all([a, b]), { step: 10 }), ['ok', 'ok']);
+  assert.equal(ctx.dev.count(0x21) - reads, 1);
+});
+
+test('r2: a command clicked after the shared read was written never decides on it', async (t) => {
+  const ctx = await setup(t, ALLOW);
+  await firstRead(ctx);
+  ctx.dev.timers = ctx.clock.timers;
+  ctx.dev.latencyMs = 300;
+  const reads = ctx.dev.count(0x21);
+  const a = click(ctx, F('zone', 1, 'opening'), 41);
+  await until(ctx.clock, () => ctx.dev.count(0x21) > reads, 'first read written', { step: 5 });
+  const b = click(ctx, F('zone', 4, 'opening'), 44);
+  assert.deepEqual(await answer(ctx, Promise.all([a, b]), { step: 10 }), ['ok', 'ok']);
+  // Its own read, written after its click.
+  assert.equal(ctx.dev.count(0x21) - reads, 2);
+});
+
+test('r2: a stop cut by a new address leaves at once to the new console', async (t) => {
+  const holder = {};
+  const ctx = await setup(t, {
+    app: {
+      connect: async (args) => {
+        if (holder.delay)
+          await new Promise((resolve) => holder.clock.timers.setTimeout(resolve, holder.delay));
+        return tcpConnect(args);
+      },
+    },
+  });
+  holder.clock = ctx.clock;
+  await firstRead(ctx);
+  const second = await fakeConsole();
+  t.after(() => second.close());
+  ctx.app.closeSession('test');
+  holder.delay = 300;
+  const t0 = ctx.clock.elapsed;
+  const stop = click(ctx, F('ac', 0, 'power'), 0);
+  await ctx.clock.advance(100);
+  // The address changes while the stop connects to the old one.
+  await ctx.app.configUpdated({ address: `127.0.0.1:${second.port}`, language: 'en' });
+  await until(ctx.clock, () => second.controls('ac').length === 1, 'stop at the new console', {
+    step: 10,
+  });
+  assert.ok(ctx.clock.elapsed - t0 < 1_000, `${ctx.clock.elapsed - t0} ms`);
+  await answer(ctx, stop);
+});
+
+test('r2: the UDP try of a closed session is stopped (it would hold port 49005)', async (t) => {
+  const signals = [];
+  const ctx = await setup(t, {
+    app: {
+      identify: ({ signal }) => {
+        signals.push(signal);
+        // The first try never ends by itself.
+        return signals.length === 1
+          ? new Promise((resolve) => signal.addEventListener('abort', () => resolve(undefined)))
+          : Promise.resolve({ consoleId: CONSOLE_ID });
+      },
+    },
+  });
+  await until(ctx.clock, () => signals.length === 1 && ctx.app.session, 'first try', { step: 10 });
+  ctx.app.closeSession('test');
+  assert.equal(signals[0].aborted, true);
+  await until(ctx.clock, () => ctx.app.live(), 'next session verified', {
+    step: 1000,
+    max: 120_000,
+  });
+});
+
+test('r2: an opening and a setpoint of one zone at once: two frames (one value per entry), both set', async (t) => {
+  const ctx = await setup(t, ALLOW);
+  await firstRead(ctx);
+  ctx.dev.timers = ctx.clock.timers;
+  ctx.dev.latencyMs = 200;
+  const acks = await answer(
+    ctx,
+    Promise.all([
+      click(ctx, F('zone', 0, 'opening'), 70),
+      click(ctx, F('zone', 0, 'target-temperature'), 24),
+    ]),
+    { step: 10 },
+  );
+  assert.deepEqual(acks, ['ok', 'ok']);
+  assert.deepEqual([ctx.dev.zones[0].percent, ctx.dev.zones[0].setpoint], [70, 24]);
+  assert.deepEqual(
+    ctx.dev.controls('zone').map((f) => f.entries.length),
+    [1, 1],
+  );
 });

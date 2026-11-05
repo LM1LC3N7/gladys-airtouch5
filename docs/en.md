@@ -111,7 +111,8 @@ kept for this address.
   not list are refused, never brought into range;
 - sent within 3 s of the click, otherwise refused with nothing sent; the
   commands that arrive together (a scene) share one read and one write of their
-  kind (ACs or zones), so a slow console still gets them all;
+  kind (ACs or zones), so a slow console still gets them all (the settings of
+  one AC clicked together go in one entry);
 - confirmed only when the console shows the value asked (a state equal to the
   one before is no confirmation), by 3.5 s; otherwise "Sent, without
   confirmation" and

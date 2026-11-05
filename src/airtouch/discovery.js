@@ -41,6 +41,10 @@ function bind(port) {
     });
   return attempt(port).then(async (socket) => {
     if (socket) return { socket, ephemeral: false };
+    // A socket just closed (the try of a previous session) may hold it a moment.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const again = await attempt(port);
+    if (again) return { socket: again, ephemeral: false };
     const other = port === 0 ? undefined : await attempt(0);
     return other ? { socket: other, ephemeral: true } : undefined;
   });
@@ -57,6 +61,7 @@ export function identityOnce({
   waitMs,
   timers = globalThis,
   onEphemeral = () => {},
+  signal,
 }) {
   return new Promise((resolve) => {
     let socket;
@@ -74,6 +79,12 @@ export function identityOnce({
       resolve(value);
     };
     timer = timers.setTimeout(() => finish(undefined), Math.max(0, waitMs));
+    // Aborted (a new session): the socket is closed at once, freeing the port.
+    if (signal?.aborted) {
+      finish(undefined);
+      return;
+    }
+    signal?.addEventListener('abort', () => finish(undefined), { once: true });
     bind(localPort).then((bound) => {
       if (!bound || done) {
         try {
@@ -113,10 +124,19 @@ export async function queryIdentity({
   waitMs,
   timers,
   onEphemeral,
+  signal,
   isCancelled = () => false,
 }) {
-  for (let i = 0; i < tries && !isCancelled(); i += 1) {
-    const identity = await identityOnce({ ip, port, localPort, waitMs, timers, onEphemeral });
+  for (let i = 0; i < tries && !isCancelled() && !signal?.aborted; i += 1) {
+    const identity = await identityOnce({
+      ip,
+      port,
+      localPort,
+      waitMs,
+      timers,
+      onEphemeral,
+      signal,
+    });
     if (identity) {
       return identity;
     }

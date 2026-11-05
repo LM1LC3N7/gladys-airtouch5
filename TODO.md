@@ -54,9 +54,17 @@
 - Other commands (3 s to be written, 3.5 s to be confirmed): the commands that
   arrive within 20 ms share one status read written after them, and the
   controls of one kind waiting go in one frame (each checked in `beforeSend`):
-  a scene on 5 zones of a console answering in 900 ms is set in about 2 s. A
-  request without answer closes the session (its late answer is never taken for
-  another), except the zone names and version (asked by nothing else). Option
+  a scene on 5 zones of a console answering in 900 ms is set in about 2 s. The
+  settings of one target clicked together (mode and setpoint of an AC, power
+  and opening of a zone) go in its one entry (a zone entry carries one value:
+  its opening and setpoint take two frames). A scene on ACs and zones needs two
+  reads and two writes: at 900 ms the kind written second is set but answered
+  "sent, without confirmation" (3.6 s > the 3.5 s of the ack). The session is
+  closed only after a real silence (3 s from the write, the stops 1.5 s): a
+  command whose own deadline passes leaves its request on the lane, whose late
+  answer is taken and dropped, never given to another request; zone names and
+  version never close it. A new session stops the UDP try of the previous one
+  (it would hold port 49005). Option
   checked on arrival and in `beforeSend`; /data must be
   writable (a stop could not be kept otherwise); decided on a fresh status;
   setpoint within the intersection of the cooling and heating limits read on
