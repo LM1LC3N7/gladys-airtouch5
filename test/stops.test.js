@@ -316,7 +316,7 @@ test('during a stop in flight, other commands of the target are refused; a zone 
   // Its damper is not moved meanwhile.
   assert.match(
     (await answer(ctx, click(ctx, F('zone', 1, 'opening'), 40))).message,
-    /stop of this device/,
+    /stop of this zone/,
   );
   assert.equal(ctx.dev.zones[1].percent, 80);
 });

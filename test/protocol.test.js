@@ -202,3 +202,23 @@ test('UDP identity: the five fields, AirTouch5, a plain console id', () => {
     assert.equal(parseIdentity(Buffer.from(text)), undefined, text.slice(0, 40));
   }
 });
+
+test('AC status entries of 8 bytes (document V1.2: "8/10 bytes", 9-10 unused) are read', () => {
+  const doc = hex(DOC.acStatus);
+  // Rebuild the two entries of the document on 8 bytes.
+  const entries = [doc.subarray(18, 26), doc.subarray(28, 36)];
+  const data = Buffer.concat([hex('2300000000080002'), ...entries]);
+  const head = Buffer.from([0xb0, 0x80, 0x01, 0xc0, 0x00, data.length]);
+  const body = Buffer.concat([head, data]);
+  const crc = Buffer.alloc(2);
+  crc.writeUInt16BE(crc16(body));
+  const frame = Buffer.concat([hex('555555aa'), body, crc]);
+  const { value } = one(frame);
+  assert.deepEqual(
+    value.map((a) => [a.ac, a.on, a.mode, a.setpoint, a.temperature]),
+    [
+      [0, true, 'heat', 22, 23],
+      [1, false, 'cool', 20, 24],
+    ],
+  );
+});

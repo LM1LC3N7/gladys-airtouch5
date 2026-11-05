@@ -314,7 +314,7 @@ export async function fakeConsole(options = {}) {
         const out = reply(frame.id, sub, entries);
         if (!out) continue;
         const send = () => !socket.destroyed && socket.write(out);
-        if (dev.latencyMs > 0) setTimeout(send, dev.latencyMs);
+        if (dev.latencyMs > 0) (dev.timers ?? globalThis).setTimeout(send, dev.latencyMs);
         else send();
       }
     });

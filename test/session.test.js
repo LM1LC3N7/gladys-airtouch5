@@ -181,3 +181,23 @@ test('a frame of a known kind that does not parse is dropped, never a value; the
   assert.equal(frames.length, 1);
   assert.equal(session.closed, false);
 });
+
+test('a request without answer closes the session, unless its kind is asked by no other', async (t) => {
+  const port = await rawServer(t, () => {});
+  const one = await open(t, port);
+  await assert.rejects(
+    one.session.request(acStatusRequest, { kind: KIND.AC_STATUS, timeoutMs: 50 }),
+    (err) => err.kind === ERROR_KINDS.TIMEOUT,
+  );
+  assert.equal(one.session.closed, true);
+  const two = await open(t, port);
+  await assert.rejects(
+    two.session.request(versionRequest, {
+      kind: KIND.VERSION,
+      timeoutMs: 50,
+      closeOnTimeout: false,
+    }),
+    (err) => err.kind === ERROR_KINDS.TIMEOUT,
+  );
+  assert.equal(two.session.closed, false);
+});

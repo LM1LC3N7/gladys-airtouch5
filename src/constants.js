@@ -110,12 +110,14 @@ export const TIMINGS = {
   /** States older than this are never published again as new (a reconnection, a device created). */
   stateFresh: 2 * MINUTE,
   /**
-   * Commands (Gladys waits 5 s for the ack): written by 3.5 s after the click
-   * or refused unsent; confirmed by a status that shows them until 4.3 s,
+   * Commands (Gladys waits 5 s for the ack): written by 3 s after the click
+   * or refused unsent; confirmed by a status that shows them until 3.5 s,
    * after which the command is "sent, without confirmation".
    */
-  commandSendBy: 3_500,
-  commandAnswerBy: 4_300,
+  commandSendBy: 3_000,
+  commandAnswerBy: 3_500,
+  /** Commands arriving together share one status read and one write (a scene). */
+  gather: 20,
   /** A stop that could not leave is tried again for this long, then kept. */
   stopRetry: 250,
   /** Reads after a command or a stop that was not confirmed. */

@@ -49,7 +49,9 @@ open at a time.
 ## Identity of the console
 
 At every connection, the integration asks the console for its id in UDP (port
-49005, at the address entered only). The devices are named after that id,
+49005, at the address entered only; the request leaves from port 49005, where
+the Polyaire document says the console answers; when that port is taken, the
+status says so). The devices are named after that id,
 chosen the first time and kept in `/data`. If the console does not answer that
 request the first time, the devices follow the address entered (fallback id
 `a-<address>`), for good. The choice is made only once written to `/data`:
@@ -58,6 +60,10 @@ while it cannot be, nothing is shown and only stops are sent.
 Once the id is known, it is checked at every connection: while the console does
 not give it, or when another console answers at this address, its states are
 not shown and only stops are sent. The status of the integration says so.
+
+A console replaced by another one (a new id at the same address) stays
+"another console": to adopt it, delete the integration's data (uninstall and
+install it again) and add its devices from the Discovery tab.
 
 ## Security
 
@@ -79,11 +85,15 @@ Switching an AC or a zone off is a **stop**. A stop:
   (console unreachable), it is tried again for 250 ms, then at every connection
   (every 10 s, 30 s, then every minute), first;
 - is confirmed only by a state read after it was sent that shows the device
-  off; otherwise Gladys shows "Stop sent, without confirmation" and the reads
-  that show the device on send it again (3 times at most);
+  off (the status the console sends back may confirm it); otherwise Gladys
+  shows "Stop sent, without confirmation" and each read written after it that
+  shows the device on (5 s and 20 s later, then the periodic reads) sends it
+  again, 3 times at most;
 - once confirmed, it is lifted when the device is read on twice in a row
-  (switched on from the console or the app), or by a command switching it on
-  that left from Gladys; never by the time.
+  (switched on from the console or the app); confirmed or not, it is lifted by
+  switching the device on from Gladys (always written then, even when the
+  device already reads on); never by the time. While a stop of a zone is not
+  seen applied, its damper and setpoint are refused.
 
 A stop is refused in two cases only: the value or the device is not
 recognised, or the device belongs to another console than the one whose id is
@@ -99,9 +109,12 @@ kept for this address.
 - decided on the state read right before (never on a state kept); a setpoint
   outside the limits read on the console, a mode or a speed the console does
   not list are refused, never brought into range;
-- sent within 3.5 s of the click, otherwise refused with nothing sent;
+- sent within 3 s of the click, otherwise refused with nothing sent; the
+  commands that arrive together (a scene) share one read and one write of their
+  kind (ACs or zones), so a slow console still gets them all;
 - confirmed only when the console shows the value asked (a state equal to the
-  one before is no confirmation); otherwise "Sent, without confirmation" and
+  one before is no confirmation), by 3.5 s; otherwise "Sent, without
+  confirmation" and
   the console is read again 5 s and 20 s later;
 - one at a time per AC or zone, in the order of the clicks.
 

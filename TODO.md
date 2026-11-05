@@ -26,7 +26,9 @@
   a minute; a restart waits for the rest of the interval (at least a minute
   after the time kept).
 - Identity: the UDP identification answer (console id), unicast to the address
-  of the session, from that address only, 3 tries of 1.5 s, at each session
+  of the session from a socket bound to port 49005 (the Polyaire document,
+  §2.a: the console answers to 49005; a free port when 49005 is taken, said in
+  the status), taken from that address only, 3 tries of 1.5 s, at each session
   and at each read while unverified. Identifier rule (frozen, in
   `src/devices.js` and the docs): `airtouch5:<console id>:ac<n>` /
   `:zone<n>`; fallback `a-<address>` when the console did not answer the first
@@ -41,11 +43,21 @@
 - Stops (AC or zone off): see the header of `src/app.js`. Kept in /data (the
   save never awaited before the write), one frame for the ACs and one for the
   zones, 1.5 s for their answer, confirmed by a status read after the write;
-  resent by contradicting reads 3 times at most (a write counts, nothing else);
-  a confirmed stop lifted by two reads in a row showing the target on, or by a
-  "switch on" of the target that left; never by the time. A stop cuts a request
+  resent only by the answer of a status read written after it that shows the
+  target on (never by the answer to the stop itself nor a push), one resend per
+  such read, 3 at most (a write counts, nothing else); a confirmed stop lifted
+  by two reads in a row showing the target on; any stop lifted by a "switch on"
+  of the target that left (written even when the target already reads on);
+  never by the time. A configuration with the same address (the first one after
+  a start, a new interval) keeps the session a kept stop opened. A stop cuts a request
   in flight silent for 1 s (that read does not count as a failure).
-- Other commands: option checked on arrival and in `beforeSend`; /data must be
+- Other commands (3 s to be written, 3.5 s to be confirmed): the commands that
+  arrive within 20 ms share one status read written after them, and the
+  controls of one kind waiting go in one frame (each checked in `beforeSend`):
+  a scene on 5 zones of a console answering in 900 ms is set in about 2 s. A
+  request without answer closes the session (its late answer is never taken for
+  another), except the zone names and version (asked by nothing else). Option
+  checked on arrival and in `beforeSend`; /data must be
   writable (a stop could not be kept otherwise); decided on a fresh status;
   setpoint within the intersection of the cooling and heating limits read on
   the console (the reference warns the document labels them wrongly), to
@@ -59,14 +71,15 @@
 
 ## Next
 
-- Check on a real console: that the identification is answered to the source
-  port of the request (else the UDP answer never crosses the container NAT and
-  every installation falls back to the address id), that a control is answered
+- Check on a real console: that the identification answer to port 49005
+  crosses the container NAT (the request leaves from 49005, so its mapping should
+  carry the answer back), that a control is answered
   by the status it changes, the message ids of the answers, and the number of
   TCP clients the console accepts.
 - The AC error code (`AC status` byte 7-8 and the error information request) as
   a sensor; the zone low battery flag; the spill and bypass flags.
-- Adopting a replaced console (another console id at the same address).
+- Adopting a replaced console without deleting the data (the docs say how,
+  today: uninstall and install again).
 
 ## Not verified
 
@@ -74,6 +87,8 @@
   built from the Polyaire document frames and airtouch5py.
 - The UDP identification across the container NAT (see Next).
 - In the sandbox Gladys, the container starts and connects (no console there).
-- Mutation: every guard mutated is caught by a test, except two equivalent
-  mutants (the publisher budget check, whose loop sends nothing when no room is
-  left; the deadline check of `beforeSend`, which the lane wait already bounds).
+- Mutation (r1 corrections): each correction has a test that fails when it is
+  broken (`test/review.test.js`). Known equivalent mutants: the publisher
+  budget check (its loop sends nothing when no room is left), the deadline of
+  `beforeSend` (the lane wait already bounds it), `live()` without the identity
+  (`consoleKey` covers it).

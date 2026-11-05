@@ -36,15 +36,18 @@
 //     every minute); only a write counts as a try: a stop never sent is never
 //     given up;
 //   - confirmed by a status read after its write that shows the target off;
-//     until then it is sent again by the reads that show the target on (3
-//     times at most). Once confirmed, it is lifted by the target read on
-//     twice in a row (switched on elsewhere) or by a command of the target
-//     that left (a click); never by the time. Kept in /data until then.
+//     until then it is sent again by the answer of each status read written
+//     after it that shows the target on (never by the answer to the stop
+//     itself), 3 times at most. Once confirmed, it is lifted by the target
+//     read on twice in a row (switched on elsewhere); confirmed or not, by a
+//     "switch on" of the target that left (always written then); never by the
+//     time. Kept in /data until then.
 // Other commands (behind the "Allow the commands" option): one at a time per
-// target, decided on a status read just before (never on what was kept),
-// option and deadline checked again right before the write, written within
-// 3.5 s of the click or refused "nothing was sent", confirmed only by a
-// status that shows the value asked (by 4.3 s), else "sent, without
+// target, decided on a status read written after the click (shared by the
+// commands arriving within 20 ms), the controls of one kind waiting written
+// in one frame, option and deadline checked again right before the write,
+// written within 3 s of the click or refused "nothing was sent", confirmed
+// only by a status that shows the value asked (by 3.5 s), else "sent, without
 // confirmation" and reads 5 s and 20 s later. Refused when /data cannot be
 // written (a stop could not be kept), during a stop of the same target, or
 // for a value outside what the console lists (setpoint limits, modes, fan
@@ -55,7 +58,15 @@ import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import { DEVICE_TRANSPORTS, createLogger } from '@gladysassistant/integration-sdk';
 import { addressKey, normalizeConfig, parseAddress, unicastIPv4 } from './config.js';
-import { FEATURES, KINDS, LIMITS, SECOND, STOP_RESENDS, TIMINGS } from './constants.js';
+import {
+  DISCOVERY_PORT,
+  FEATURES,
+  KINDS,
+  LIMITS,
+  SECOND,
+  STOP_RESENDS,
+  TIMINGS,
+} from './constants.js';
 import {
   acStates,
   boundsOf,
@@ -142,6 +153,8 @@ export class AirTouchApp {
     this.memoryLoading = undefined;
     this.writable = true;
     this.generation = 0;
+    /** Bumped only when the address changes (or at stop): a session opened for an older address is dropped. */
+    this.addressGen = 0;
     this.closed = false;
     this.booted = undefined;
     this.lifecycle = Promise.resolve();
@@ -154,6 +167,8 @@ export class AirTouchApp {
     this.lastTestAt = -Infinity;
     /** Every frame read gets the next number, for life (a stop compares it to its write). */
     this.frameSeq = 0;
+    /** Every status read written gets the next number, for life (see readTag). */
+    this.readSeq = 0;
     this.resetConsole();
     /** `${console id}:${target}` -> the stop guard (see the header). */
     this.guards = new Map();
@@ -168,6 +183,10 @@ export class AirTouchApp {
     this.waitingCommands = 0;
     /** `${target}:${field}` -> { from, expected, moved, until }: sent, not seen yet. */
     this.commandGuards = new Map();
+    /** kind -> the shared status read of the commands; kind -> the controls waiting, their writer. */
+    this.statusReads = new Map();
+    this.writeQueues = new Map();
+    this.writers = new Map();
   }
 
   /** What is known of the console, reset when the address or the interval changes. */
@@ -309,10 +328,21 @@ export class AirTouchApp {
   async restart() {
     this.generation += 1;
     const known = this.lastAttemptWall;
-    this.closeSession('configuration changed');
     this.clearReadTimers();
     const stopsAddress = this.memory.address;
-    this.resetConsole();
+    const nextKey = this.config.address ? addressKey(this.config.address) : undefined;
+    if (nextKey !== undefined && nextKey === this.sessionKey) {
+      // The same address (the first configuration after a start, a new
+      // interval): the session, its identity and what it read are kept, and a
+      // stop it is writing goes on.
+      this.running = undefined;
+      this.nextReadAt = undefined;
+    } else {
+      this.addressGen += 1;
+      this.sessionKey = undefined;
+      this.closeSession('configuration changed');
+      this.resetConsole();
+    }
     this.published = undefined;
     this.badge = undefined;
     this.lastStatus = undefined;
@@ -360,6 +390,7 @@ export class AirTouchApp {
   async stop() {
     this.closed = true;
     this.generation += 1;
+    this.addressGen += 1;
     this.clearReadTimers();
     if (this.configTimer) this.timers.clearTimeout(this.configTimer);
     if (this.stopRetry.timer) this.timers.clearTimeout(this.stopRetry.timer);
@@ -404,6 +435,7 @@ export class AirTouchApp {
             ...g,
             // Loaded: any status read from now on is after its write.
             afterSeq: -1,
+            afterRead: -1,
             other: 0,
             due: !g.confirmed && (!g.sent || g.resends < STOP_RESENDS),
             waiters: [],
@@ -479,7 +511,8 @@ export class AirTouchApp {
     if (!address) {
       throw new SessionError(ERROR_KINDS.CONNECT, 'no address');
     }
-    const generation = this.generation;
+    const addressGen = this.addressGen;
+    this.sessionKey = addressKey(address);
     // The last session, even one already closed: its socket may still be closing.
     const old = this.lastSession;
     if (old) {
@@ -502,15 +535,16 @@ export class AirTouchApp {
       timeoutMs: TIMINGS.connectTimeout,
       timers: this.timers,
     });
-    if (generation !== this.generation || this.closed) {
+    if (addressGen !== this.addressGen || this.closed) {
+      // The address changed meanwhile: never a session to the old one.
       socket.destroy();
-      throw new SessionError(ERROR_KINDS.CLOSED, 'configuration changed');
+      throw new SessionError(ERROR_KINDS.CLOSED, 'configuration changed', { code: 'ERESTART' });
     }
     const session = new Session({
       socket,
       monotonic: this.monotonic,
       timers: this.timers,
-      onFrame: (parsed) => this.onFrame(session, parsed),
+      onFrame: (parsed, meta) => this.onFrame(session, parsed, meta),
       onClose: (reason) => this.sessionClosed(session, reason),
     });
     this.session = session;
@@ -555,7 +589,11 @@ export class AirTouchApp {
    * One request on the lane: `priority`, waiting at most `waitMs` for its
    * turn; resolves the value of the answer.
    */
-  async exchange(priority, build, { kind, waitBy, timeoutMs, answerBy, beforeSend, onWritten }) {
+  async exchange(
+    priority,
+    build,
+    { kind, waitBy, timeoutMs, answerBy, beforeSend, onWritten, tag, closeOnTimeout },
+  ) {
     const waitMs = waitBy - this.monotonic();
     if (!(waitMs > 0)) {
       throw new SessionError(ERROR_KINDS.LATE, 'too late');
@@ -570,7 +608,14 @@ export class AirTouchApp {
         throw new SessionError(ERROR_KINDS.LATE, 'too late');
       }
       const left = answerBy !== undefined ? answerBy - this.monotonic() : timeoutMs;
-      const value = await session.request(build, { kind, timeoutMs: left, beforeSend, onWritten });
+      const value = await session.request(build, {
+        kind,
+        timeoutMs: left,
+        beforeSend,
+        onWritten,
+        tag,
+        closeOnTimeout,
+      });
       return { value, session };
     } finally {
       release();
@@ -594,6 +639,14 @@ export class AirTouchApp {
   async doCheckIdentity(session) {
     const identity = await this.identify({
       ip: this.ip,
+      port: DISCOVERY_PORT,
+      localPort: DISCOVERY_PORT,
+      onEphemeral: (ephemeral) => {
+        if (this.udpEphemeral !== ephemeral) {
+          this.udpEphemeral = ephemeral;
+          this.lastStatus = undefined;
+        }
+      },
       tries: TIMINGS.identityTries,
       waitMs: TIMINGS.identityWait,
       timers: this.timers,
@@ -762,13 +815,32 @@ export class AirTouchApp {
     }
   }
 
+  /**
+   * The tag of a status read: numbered when written. Only the answer of a read
+   * written after a stop may send that stop again (never the answer to the
+   * stop itself, nor a status the console pushed).
+   */
+  readTag() {
+    const tag = { read: true, readSeq: undefined };
+    tag.onWritten = () => {
+      this.readSeq += 1;
+      tag.readSeq = this.readSeq;
+    };
+    return tag;
+  }
+
   async readRound(generation, used) {
-    const ask = async (build, kind) => {
+    const ask = async (build, kind, { secondary = false } = {}) => {
+      const tag = this.readTag();
       const { session } = await this.exchange(PRIORITY.READ, build, {
         kind,
         // A read waits for the stops and commands ahead of it.
         waitBy: this.monotonic() + TIMINGS.connectTimeout + TIMINGS.requestTimeout,
         timeoutMs: TIMINGS.requestTimeout,
+        tag,
+        onWritten: tag.onWritten,
+        // A kind no other request asks: its late answer cannot be taken for another.
+        closeOnTimeout: !secondary,
       });
       if (session !== used.session) throw new SessionError(ERROR_KINDS.CLOSED, 'session changed');
     };
@@ -783,7 +855,7 @@ export class AirTouchApp {
         [versionRequest, KIND.VERSION],
       ]) {
         try {
-          await ask(build, kind);
+          await ask(build, kind, { secondary: true });
         } catch (err) {
           if (err.kind === ERROR_KINDS.CLOSED) throw err;
           this.logger.info(`AirTouch 5: ${kind} not read (${errorReason(err)})`);
@@ -817,10 +889,13 @@ export class AirTouchApp {
           [acStatusRequest, KIND.AC_STATUS],
           [zoneStatusRequest, KIND.ZONE_STATUS],
         ]) {
+          const tag = this.readTag();
           this.exchange(PRIORITY.READ, build, {
             kind,
             waitBy,
             timeoutMs: TIMINGS.requestTimeout,
+            tag,
+            onWritten: tag.onWritten,
           }).catch(() => {});
         }
       }, delay);
@@ -831,7 +906,7 @@ export class AirTouchApp {
   // --- Frames ----------------------------------------------------------------
 
   /** Every frame of the session, asked or pushed, in the order the console sent them. */
-  onFrame(session, parsed) {
+  onFrame(session, parsed, meta = {}) {
     if (this.session !== session) return;
     this.frameSeq += 1;
     const seq = this.frameSeq;
@@ -840,13 +915,13 @@ export class AirTouchApp {
       case KIND.AC_STATUS:
         for (const state of parsed.value) {
           this.acs.set(state.ac, { state, seq, at });
-          this.observe({ kind: KINDS.AC, number: state.ac }, state, seq);
+          this.observe({ kind: KINDS.AC, number: state.ac }, state, seq, meta.tag);
         }
         break;
       case KIND.ZONE_STATUS:
         for (const state of parsed.value) {
           this.zones.set(state.zone, { state, seq, at });
-          this.observe({ kind: KINDS.ZONE, number: state.zone }, state, seq);
+          this.observe({ kind: KINDS.ZONE, number: state.zone }, state, seq, meta.tag);
         }
         break;
       case KIND.AC_ABILITY:
@@ -868,7 +943,7 @@ export class AirTouchApp {
   }
 
   /** A status of a target, through its guards (stop and commands). */
-  observe(target, state, seq) {
+  observe(target, state, seq, tag) {
     const key = targetKey(target);
     const guard = this.guardFor(key);
     if (guard && guard.sent && seq > guard.afterSeq && typeof state.on === 'boolean') {
@@ -887,8 +962,15 @@ export class AirTouchApp {
         if (guard.other >= 2) {
           this.liftGuard(guard);
         }
-      } else if (!guard.due && guard.resends < STOP_RESENDS && !guard.writing) {
-        // Contradicted before it was seen applied: sent again (counted when written).
+      } else if (
+        !guard.due &&
+        guard.resends < STOP_RESENDS &&
+        !guard.writing &&
+        tag?.read &&
+        tag.readSeq > guard.afterRead
+      ) {
+        // Contradicted by a read written after it, before it was seen applied:
+        // sent again (counted when written), once per such read.
         guard.due = true;
         this.kickStops();
       }
@@ -1116,6 +1198,7 @@ export class AirTouchApp {
     if (this.memoryState === 'unreadable') notes.push(T.dataUnreadable);
     else if (!this.writable) notes.push(T.dataUnwritable);
     notes.push(...this.stopNotes());
+    if (this.udpEphemeral) notes.push(T.udpPortBusy);
     if (!this.config) {
       const wait = this.configAt === undefined ? SECOND : this.configAt - this.monotonic();
       return [false, join(T.configUnread(age(Math.max(SECOND, wait))), ...notes)];
@@ -1228,7 +1311,7 @@ export class AirTouchApp {
     const guard = this.guardFor(key);
     if (target.kind === KINDS.ZONE && change.field !== 'on' && guard && !guard.confirmed) {
       // A zone being stopped: a value that might open it again waits for the stop.
-      throw this.refusal(ERRORS.stopping);
+      throw this.refusal(ERRORS.zoneStopPending);
     }
     if (this.waitingCommands >= LIMITS.queue) {
       throw this.refusal(ERRORS.queueFull);
@@ -1276,17 +1359,12 @@ export class AirTouchApp {
     if (entry.cancelled) throw this.refusal(ERRORS.cancelled);
     const isAc = target.kind === KINDS.AC;
     const statusKind = isAc ? KIND.AC_STATUS : KIND.ZONE_STATUS;
-    const statusRequest = isAc ? acStatusRequest : zoneStatusRequest;
     const find = (list) => list.find((s) => (isAc ? s.ac : s.zone) === target.number);
-    // The state read just before: the decision is made on it only.
+    // The state read just before (a read written after the click, shared by
+    // the commands that arrive together): the decision is made on it only.
     let state;
     try {
-      const { value } = await this.exchange(PRIORITY.COMMAND, statusRequest, {
-        kind: statusKind,
-        waitBy: sendBy,
-        answerBy: sendBy,
-      });
-      state = find(value);
+      state = find(await this.sharedStatus(statusKind, sendBy));
     } catch (err) {
       if (err instanceof LaneTimeout || err.kind === ERROR_KINDS.LATE)
         throw this.refusal(ERRORS.tooSlow);
@@ -1300,66 +1378,184 @@ export class AirTouchApp {
     if (state[field] === undefined) throw this.refusal(ERRORS.unknownState);
     const guardKey = `${key}:${field}`;
     this.checkPrevious(key, field, state);
-    if (same(state[field], wanted.value) && !this.guardActive(guardKey)) {
+    // Switching on a target under a stop guard is always written (it lifts the
+    // guard once it left), even when the target already reads on.
+    const stopGuard = field === 'on' && wanted.value === true ? this.guardFor(key) : undefined;
+    if (same(state[field], wanted.value) && !this.guardActive(guardKey) && !stopGuard) {
       // Already so: nothing sent.
       return;
     }
-    const build = (id) =>
-      isAc ? acControl(id, [wanted.control]) : zoneControl(id, [wanted.control]);
     const plan = { from: state[field], expected: wanted.value };
-    let written = false;
     this.logger.info(`AirTouch 5: ${key} ${field} -> ${String(wanted.value)}`);
-    let answer;
-    try {
-      answer = await this.exchange(PRIORITY.COMMAND, build, {
-        kind: statusKind,
-        waitBy: sendBy,
-        answerBy,
-        beforeSend: () => this.beforeSend(entry, sendBy),
-        onWritten: () => {
-          written = true;
-          if (field === 'on' && wanted.value === true) {
-            // A newer command of the target that left: the stop guard is over.
-            const guard = this.guardFor(key);
-            if (guard) this.liftGuard(guard);
-          }
-        },
-      });
-    } catch (err) {
-      if (err.beforeSend) throw err;
-      if (!written) {
-        if (err instanceof LaneTimeout || err.kind === ERROR_KINDS.LATE)
-          throw this.refusal(ERRORS.tooSlow);
-        throw this.refusal(ERRORS.notConnected);
-      }
+    // Written together with the other commands of the same kind waiting (one frame).
+    const result = await this.batchWrite(target.kind, {
+      control: wanted.control,
+      entry,
+      sendBy,
+      answerBy,
+      onWritten: () => {
+        if (stopGuard) {
+          // A newer command of the target that left: the stop guard is over.
+          const guard = this.guardFor(key);
+          if (guard) this.liftGuard(guard);
+        }
+      },
+    });
+    if (result.refused) throw result.error;
+    if (!result.written) {
+      const err = result.error;
+      if (err instanceof LaneTimeout || err?.kind === ERROR_KINDS.LATE)
+        throw this.refusal(ERRORS.tooSlow);
+      throw this.refusal(ERRORS.notConnected);
+    }
+    if (result.error) {
       // Written, no answer: it may have been applied.
       this.guardCommand(guardKey, plan);
       this.scheduleFollowUps();
       throw this.refusal(ERRORS.sentUnconfirmed);
     }
     // Confirmed only by a status showing the value asked, never one equal to the state before.
-    const applied = (s) => s && same(s[field], wanted.value) && !same(plan.from, wanted.value);
-    if (applied(find(answer.value))) {
+    // (A "switch on" written only to lift a stop guard of a target that read on
+    // already: its status showing it on is the answer, there was nothing to move.)
+    const applied = (s) =>
+      s &&
+      same(s[field], wanted.value) &&
+      (!same(plan.from, wanted.value) || (stopGuard && !this.guardActive(guardKey)));
+    if (applied(find(result.value))) {
       this.commandGuards.delete(guardKey);
       return;
     }
     // The answer does not show it yet: one read back within the budget.
-    try {
-      const { value } = await this.exchange(PRIORITY.COMMAND, statusRequest, {
-        kind: statusKind,
-        waitBy: answerBy,
-        answerBy,
-      });
-      if (applied(find(value))) {
-        this.commandGuards.delete(guardKey);
-        return;
+    if (answerBy - this.monotonic() > TIMINGS.gather) {
+      try {
+        if (applied(find(await this.sharedStatus(statusKind, answerBy)))) {
+          this.commandGuards.delete(guardKey);
+          return;
+        }
+      } catch {
+        // "sent, without confirmation" below
       }
-    } catch {
-      // "sent, without confirmation" below
     }
     this.guardCommand(guardKey, plan);
     this.scheduleFollowUps();
     throw this.refusal(ERRORS.sentUnconfirmed);
+  }
+
+  /**
+   * A status read of `kind` written after this call, shared by the commands
+   * that ask within a few milliseconds (a scene): resolves the list read.
+   */
+  sharedStatus(kind, waitBy) {
+    let read = this.statusReads.get(kind);
+    if (!read || read.written || read.done) {
+      const fresh = { written: false, done: false };
+      const tag = this.readTag();
+      fresh.promise = (async () => {
+        await new Promise((resolve) => this.timers.setTimeout(resolve, TIMINGS.gather));
+        const { value } = await this.exchange(
+          PRIORITY.COMMAND,
+          kind === KIND.AC_STATUS ? acStatusRequest : zoneStatusRequest,
+          {
+            kind,
+            waitBy,
+            answerBy: waitBy,
+            tag,
+            onWritten: () => {
+              fresh.written = true;
+              tag.onWritten();
+            },
+          },
+        );
+        return value;
+      })().finally(() => {
+        fresh.done = true;
+      });
+      fresh.promise.catch(() => {});
+      this.statusReads.set(kind, fresh);
+      read = fresh;
+    }
+    return read.promise;
+  }
+
+  /**
+   * Queues a control of a target for the next write of its kind (ACs or
+   * zones): the commands waiting go in one frame. Resolves `{ written, value
+   * (the status answered), error, refused }`.
+   */
+  batchWrite(kind, item) {
+    let queue = this.writeQueues.get(kind);
+    if (!queue) {
+      queue = [];
+      this.writeQueues.set(kind, queue);
+    }
+    const done = new Promise((resolve) => {
+      item.resolve = resolve;
+    });
+    queue.push(item);
+    if (!this.writers.has(kind)) {
+      this.writers.set(
+        kind,
+        this.runWrites(kind, queue).finally(() => this.writers.delete(kind)),
+      );
+    }
+    return done;
+  }
+
+  async runWrites(kind, queue) {
+    const isAc = kind === KINDS.AC;
+    while (queue.length > 0) {
+      const batch = [];
+      const waitBy = Math.max(...queue.map((i) => i.sendBy));
+      const answerBy = Math.max(...queue.map((i) => i.answerBy));
+      try {
+        const { value } = await this.exchange(
+          PRIORITY.COMMAND,
+          (id) =>
+            isAc
+              ? acControl(
+                  id,
+                  batch.map((i) => i.control),
+                )
+              : zoneControl(
+                  id,
+                  batch.map((i) => i.control),
+                ),
+          {
+            kind: isAc ? KIND.AC_STATUS : KIND.ZONE_STATUS,
+            waitBy,
+            answerBy,
+            // Each one checked right before the write (option, cancel, identity, deadline).
+            beforeSend: () => {
+              for (const item of queue.splice(0)) {
+                try {
+                  this.beforeSend(item.entry, item.sendBy);
+                  batch.push(item);
+                } catch (err) {
+                  item.resolve({ written: false, error: err, refused: true });
+                }
+              }
+              if (batch.length === 0) throw new Error('nothing to write');
+            },
+            onWritten: () => {
+              for (const item of batch) {
+                item.written = true;
+                item.onWritten?.();
+              }
+            },
+          },
+        );
+        for (const item of batch) item.resolve({ written: true, value });
+      } catch (err) {
+        if (batch.length === 0) {
+          // Never written: refused in beforeSend (answered there), or no lane / session.
+          if (!err.beforeSend) {
+            for (const item of queue.splice(0)) item.resolve({ written: false, error: err });
+          }
+          continue;
+        }
+        for (const item of batch) item.resolve({ written: item.written === true, error: err });
+      }
+    }
   }
 
   /**
@@ -1487,6 +1683,7 @@ export class AirTouchApp {
       resends: 0,
       other: 0,
       afterSeq: Infinity,
+      afterRead: Infinity,
       due: true,
       writing: false,
       waiters: previous?.waiters ?? [],
@@ -1563,6 +1760,7 @@ export class AirTouchApp {
     for (let round = 0; round < 50 && !this.closed; round += 1) {
       const due = this.dueGuards();
       if (due.length === 0) return;
+      // 'restart' (cut by a new address, not a failure): truthy, tried again at once.
       const sent = await this.sendStops(due);
       if (sent) {
         this.stopRetry.tries = 0;
@@ -1593,6 +1791,8 @@ export class AirTouchApp {
       try {
         session = await this.ensureSession({ deadline: this.monotonic() + TIMINGS.connectTimeout });
       } catch (err) {
+        // Cut by a new address (not a failure of the console): tried again at once.
+        if (err.code === 'ERESTART') return 'restart';
         this.reason = errorReason(err);
         this.lastStatus = undefined;
         this.updateStatus().catch(() => {});
@@ -1636,6 +1836,7 @@ export class AirTouchApp {
                   g.due = false;
                   g.writing = false;
                   g.afterSeq = this.frameSeq;
+                  g.afterRead = this.readSeq;
                 }
                 this.logger.info(`AirTouch 5: stop -> ${batch.map((g) => g.target).join(', ')}`);
                 this.lastStatus = undefined;

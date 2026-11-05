@@ -105,6 +105,10 @@ export const T = {
     'The id of the devices cannot be kept in /data: nothing is shown and only stops are sent, until it can be.',
     "L'identifiant des appareils ne peut pas être gardé dans /data : rien n'est affiché et seuls les arrêts partent, tant qu'il ne peut pas l'être.",
   ),
+  udpPortBusy: both(
+    'UDP port 49005 is taken in the container: the identity is asked from another port, which a console following its document does not answer.',
+    "Le port UDP 49005 est pris dans le conteneur : l'identité est demandée depuis un autre port, auquel une console conforme à son document ne répond pas.",
+  ),
   dataUnreadable: both(
     'The /data file cannot be read: the identity of the devices is not chosen and nothing is written there until it can be.',
     "Le fichier de /data est illisible : l'identité des appareils n'est pas choisie et rien n'y est écrit tant qu'il l'est.",
@@ -125,8 +129,8 @@ export const T = {
     ),
   stopsContradicted: (targets) =>
     both(
-      `Stop sent again 3 times, the console still shows it on (a click on the device lifts it): ${list(targets).en}.`,
-      `Arrêt renvoyé 3 fois, la console le montre toujours en marche (un clic sur l'appareil le lève) : ${list(targets).fr}.`,
+      `Stop sent again 3 times, the console still shows it on (switching it on from Gladys lifts it): ${list(targets).en}.`,
+      `Arrêt renvoyé 3 fois, la console le montre toujours en marche (l'allumer depuis Gladys le lève) : ${list(targets).fr}.`,
     ),
   test: {
     cooldown: both('Tested a few seconds ago.', 'Testé il y a quelques secondes.'),
@@ -176,6 +180,10 @@ export const ERRORS = {
   stopping: both(
     'A stop of this device is in progress: nothing was sent.',
     "Un arrêt de cet appareil est en cours : rien n'a été envoyé.",
+  ),
+  zoneStopPending: both(
+    'A stop of this zone is not seen applied yet: nothing was sent (switching the zone on from Gladys lifts it).',
+    "Un arrêt de cette zone n'est pas encore vu appliqué : rien n'a été envoyé (allumer la zone depuis Gladys le lève).",
   ),
   queueFull: both(
     'Too many commands waiting: nothing was sent.',

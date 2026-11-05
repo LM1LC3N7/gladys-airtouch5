@@ -188,7 +188,7 @@ export class Session {
           return;
         }
       }
-      this.onFrame(parsed, { answer });
+      this.onFrame(parsed, { answer, tag: answer ? pending.tag : undefined });
       if (this.closed) {
         return;
       }
@@ -205,7 +205,7 @@ export class Session {
    * `onWritten()` right after. Rejects a SessionError whose `sent` tells
    * whether the request was written.
    */
-  request(build, { kind, timeoutMs, beforeSend, onWritten }) {
+  request(build, { kind, timeoutMs, beforeSend, onWritten, tag, closeOnTimeout = true }) {
     if (this.closed) {
       return Promise.reject(new SessionError(ERROR_KINDS.CLOSED, 'session closed'));
     }
@@ -225,12 +225,16 @@ export class Session {
     this.nextId = (this.nextId % 255) + 1;
     const frame = build(id);
     return new Promise((resolve, reject) => {
-      const pending = { kind, id, resolve, reject, frames: 0, written: false, sent: false };
+      const pending = { kind, id, tag, resolve, reject, frames: 0, written: false, sent: false };
       this.pending = pending;
       pending.timer = this.timers.setTimeout(() => {
         if (this.pending === pending) {
           this.pending = undefined;
           reject(new SessionError(ERROR_KINDS.TIMEOUT, 'no answer', { sent: pending.sent }));
+          // Its answer may still come: closed, so that a later request of the same
+          // kind never takes it for its own (only a kind no other request asks
+          // may keep the session).
+          if (closeOnTimeout) this.close('no answer');
         }
       }, timeoutMs);
       pending.writtenAt = this.monotonic();

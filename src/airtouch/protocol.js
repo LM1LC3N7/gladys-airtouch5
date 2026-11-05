@@ -288,7 +288,8 @@ export function parseAcStatus(entries, repeatLength, count) {
   if (count === 0) {
     return [];
   }
-  if (repeatLength < 10 || count > LIMITS.acs) {
+  // V1.2 of the document: "8/10 bytes" per AC (bytes 9-10 unused), 14 on console 1.2.0.
+  if (repeatLength < 8 || count > LIMITS.acs) {
     throw new ProtocolError('bad AC status');
   }
   const list = [];
