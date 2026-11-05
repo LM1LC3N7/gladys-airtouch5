@@ -1,61 +1,116 @@
-# Demo Devices Template
+# AirTouch 5
 
-This is the user documentation of the integration. Gladys re-hosts this file
-and shows a permanent **Documentation** link to it in the Configuration screen
-(in the user's language, with English as the fallback) — it is when
-configuring that the user needs it most. Keep the short onboarding hints in
-the `section` blocks of the manifest `config_schema`; put the long
-step-by-step (screenshots, troubleshooting…) here.
+Unofficial Gladys integration for the **AirTouch 5** consoles of Polyaire,
+which drive a ducted air-conditioning system (one or more air conditioners and
+their zones, each behind a motorised damper). Common in Australia and New
+Zealand. The integration speaks the local protocol of the console (the
+"AirTouch 5 Communication Protocol" published by Polyaire), on your network
+(TCP port 9005), without any cloud.
+
+Never tested with a real device: the integration follows the protocol as the
+airtouch5py library (used by Home Assistant) reads and writes it, and the
+sample frames of the Polyaire document. Not affiliated with Polyaire.
 
 ## What you get
 
-Six demo devices show up after installation: a weather station (real data
-from Open-Meteo), a switch, a dimmable light, a smart plug with power
-metering, a motion sensor and a camera.
+One Gladys device per **air conditioner** (AC), with:
 
-## Configuration
+- **On/off**;
+- **Mode** and **Fan speed**: only the values the console lists for that AC
+  (automatic, cooling, heating, drying, fan only; automatic, quiet, low,
+  medium, high, turbo). The "powerful" speed has no Gladys value: it is neither
+  offered nor shown;
+- **Setpoint**: bounded to the limits read on the console (the intersection of
+  its cooling and heating limits, to the degree);
+- **Temperature** read by the AC.
 
-1. Open the **Configuration** tab of the integration.
-2. Set the **latitude** and **longitude** the demo weather station should
-   observe (they default to Paris), and pick your temperature unit.
-   The **refresh interval** sets how often the weather station and the
-   plug's power are read: every 5 minutes by default, every minute at most.
-3. Save: the devices appear in the **Discovery** tab, ready to be added.
+One Gladys device per **zone**, with:
 
-The **Prefer the local connection** toggle drives the demo plug: it reports
-the channel it actually uses as a badge (local or cloud), with an orange dot
-when it runs degraded (local refused, cloud fallback).
+- **On/off** of the zone;
+- **Damper opening** (0 to 100 %);
+- for a zone with a sensor: **Setpoint** (bounded to the limits of its AC) and
+  **Temperature**.
 
-## Actions
+The names of the ACs and zones are those of the console. Temperatures are in °C.
 
-- **Test the weather provider** — performs a live request to Open-Meteo and
-  shows the current temperature and humidity under the button.
-- **Identify a device** — pick one of your devices in the list and it will
-  signal itself (the demo light "blinks" in the logs).
+## Setup
 
-## Scenes
+1. Give the console a fixed IP address in your router.
+2. In Gladys, open the **AirTouch 5** integration, enter the IP address of the
+   console (add `:port` only if it is not 9005) and save.
+3. The ACs and zones show up in the **Discovery** tab: add them.
+4. To switch them on and set them from Gladys, turn on **Allow the commands**.
+   Without it, only stops are sent.
 
-The integration adds its own cards to the scene editor (Gladys 5.1 or
-later), under the **Integrations** category:
+**Refresh interval**: 60 s by default (30 to 600 s). The console also sends its
+changes by itself: they show as they come. One connection to the console is
+open at a time.
 
-- **Motion detected** (trigger) — starts the scene when a demo motion sensor
-  sees something move. Optionally pick the sensor and what moved (person,
-  animal); left empty, any detection matches. The following actions can
-  read what moved with `{{triggerEvent.data.target}}`.
-- **Identify a device** (action) — makes the chosen device signal itself.
-  It returns whether the device could signal itself, so the following
-  actions can depend on it.
+## Identity of the console
 
-## Dashboard
+At every connection, the integration asks the console for its id in UDP (port
+49005, at the address entered only). The devices are named after that id,
+chosen the first time and kept in `/data`. If the console does not answer that
+request the first time, the devices follow the address entered (fallback id
+`a-<address>`), for good. The choice is made only once written to `/data`:
+while it cannot be, nothing is shown and only stops are sent.
 
-Add the **Demo status** widget to a dashboard: it shows the live
-temperature of the weather station and the power of the office plug, the
-connection the plug currently uses (orange when degraded) and the observed
-location. Its **Identify the light** button makes the demo light signal
-itself.
+Once the id is known, it is checked at every connection: while the console does
+not give it, or when another console answers at this address, its states are
+not shown and only stops are sent. The status of the integration says so.
+
+## Security
+
+The protocol of the console has no password: any machine of your network can
+drive it. Keep it on a trusted network, never exposed to the Internet.
+
+### Stops
+
+Switching an AC or a zone off is a **stop**. A stop:
+
+- leaves even when commands are not allowed, before the first read, during a
+  read or another command, right after a restart, and even before Gladys gives
+  the configuration (the address is kept in `/data`);
+- leaves even when the AC or zone is already off;
+- goes before the reads and the commands; a read that has received nothing for
+  a second is cut to let it through;
+- cancels the commands of the same AC or zone that had not left yet;
+- is kept in `/data` until a read shows it applied; when it could not leave
+  (console unreachable), it is tried again for 250 ms, then at every connection
+  (every 10 s, 30 s, then every minute), first;
+- is confirmed only by a state read after it was sent that shows the device
+  off; otherwise Gladys shows "Stop sent, without confirmation" and the reads
+  that show the device on send it again (3 times at most);
+- once confirmed, it is lifted when the device is read on twice in a row
+  (switched on from the console or the app), or by a command switching it on
+  that left from Gladys; never by the time.
+
+A stop is refused in two cases only: the value or the device is not
+recognised, or the device belongs to another console than the one whose id is
+kept for this address.
+
+### Other commands
+
+- off by default (**Allow the commands** option), checked again right before
+  the write;
+- refused while the identity of the console is not checked, during a stop of
+  the same AC or zone, or when `/data` cannot be written (a stop could not be
+  kept there);
+- decided on the state read right before (never on a state kept); a setpoint
+  outside the limits read on the console, a mode or a speed the console does
+  not list are refused, never brought into range;
+- sent within 3.5 s of the click, otherwise refused with nothing sent;
+- confirmed only when the console shows the value asked (a state equal to the
+  one before is no confirmation); otherwise "Sent, without confirmation" and
+  the console is read again 5 s and 20 s later;
+- one at a time per AC or zone, in the order of the clicks.
 
 ## Troubleshooting
 
-The integration logs everything it does: check the integration logs from the
-Gladys UI (or `docker logs` on the host) with `LOG_LEVEL=debug` for the full
-detail.
+The status of the configuration page tells the state of the connection, of the
+identity and of the stops waiting. The **Test the connection** button reads the
+console when its read is due (never sooner than the interval) and shows the
+result.
+
+A failed read is tried again after 30 s, 1, 2, then 5 min, never sooner than
+the interval.
